@@ -61,6 +61,37 @@ def deprecated_precision(ctx, param, value):
     default=False,
     help="Use the highest resolution of sources or the resolution of the first source argument.",
 )
+@click.option(
+    "--balance",
+    type=click.Choice(["affine"]),
+    default=None,
+    help="Jointly calibrate source gains/biases from overlaps.",
+)
+@click.option(
+    "--source-id",
+    "source_ids",
+    multiple=True,
+    default=None,
+    help="Unique source ID, repeatable once per input file (same order).",
+)
+@click.option(
+    "--balance-reference",
+    default=None,
+    help="Source ID to use as the calibration reference (gain 1, bias 0).",
+)
+@click.option(
+    "--balance-report",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="JSON file receiving the balance model and diagnostics.",
+)
+@click.option(
+    "--balance-sample-limit",
+    type=int,
+    default=100000,
+    show_default=True,
+    help="Maximum total retained paired samples for the whole fit.",
+)
 @options.creation_options
 @click.pass_context
 def merge(
@@ -80,6 +111,11 @@ def merge(
     target_aligned_pixels,
     mem_limit,
     use_highest_res,
+    balance,
+    source_ids,
+    balance_reference,
+    balance_report,
+    balance_sample_limit,
     creation_options,
 ):
     """Copy valid pixels from input files to an output file.
@@ -111,6 +147,29 @@ def merge(
     if driver:
         creation_options.update(driver=driver)
 
+    balance_kwargs = {}
+    if balance is not None:
+        if len(source_ids) != len(files):
+            raise click.BadParameter(
+                "--source-id must be given once per input file "
+                f"(got {len(source_ids)} IDs for {len(files)} files)"
+            )
+        if not balance_reference:
+            raise click.BadParameter(
+                "--balance-reference is required with --balance"
+            )
+        if not balance_report:
+            raise click.BadParameter(
+                "--balance-report is required with --balance"
+            )
+        balance_kwargs = dict(
+            balance=balance,
+            source_ids=list(source_ids),
+            balance_reference=balance_reference,
+            balance_report=balance_report,
+            balance_sample_limit=balance_sample_limit,
+        )
+
     with ctx.obj["env"]:
         merge_tool(
             files,
@@ -126,4 +185,5 @@ def merge(
             use_highest_res=use_highest_res,
             dst_path=output,
             dst_kwds=creation_options,
+            **balance_kwargs,
         )

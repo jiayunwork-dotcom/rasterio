@@ -5,6 +5,7 @@ Advanced Topics
    :maxdepth: 1
 
    calc
+   balancing
    color
    concurrency
    configuration

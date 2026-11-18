@@ -1,5 +1,6 @@
 """Raster warping and reprojection."""
 
+from contextlib import ExitStack
 from math import ceil, floor
 
 from affine import Affine
@@ -8,6 +9,11 @@ import numpy as np
 import rasterio
 
 from rasterio._base import _transform
+from rasterio.balance import (
+    BalanceModel,
+    calibrated_vrt_xml,
+    balance_model_from_dict,
+)
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.env import ensure_env, require_gdal_version
@@ -178,6 +184,8 @@ def reproject(
     init_dest_nodata=True,
     warp_mem_limit=0,
     src_geoloc_array=None,
+    balance_model=None,
+    balance_source=None,
     **kwargs
 ):
     """Reproject a source raster to a destination raster.
@@ -274,6 +282,17 @@ def reproject(
         transformer :cpp:func:`GDALCreateGenImgProjTransformer2` (for example,
         MAX_GCP_ORDER=2) and the :cpp:struct:`GDALWarpOptions` (for example,
         INIT_DEST=NO_DATA).
+    balance_model : dict or BalanceModel, optional
+        An affine balance model as produced by
+        :func:`rasterio.merge.merge` with ``balance="affine"`` (or any
+        object returned by ``json.load`` of its report).  When given, the
+        source is calibrated into the reference frame while warping, using
+        the model's scales/offsets, gain/bias coefficients and validity
+        semantics.  Only file :class:`rasterio.Band` sources are supported;
+        ndarray sources raise ``ValueError``.
+    balance_source : str, optional
+        Source ID within ``balance_model`` identifying the source being
+        warped.  Required when ``balance_model`` is given.
 
     Returns
     ---------
@@ -308,6 +327,60 @@ def reproject(
 
     if destination is None and dst_transform is not None:
         raise ValueError("Must provide destination if dst_transform is provided.")
+
+    balance_stack = ExitStack()
+    if balance_model is not None:
+        if isinstance(balance_model, BalanceModel):
+            model = balance_model
+        else:
+            model = BalanceModel(balance_model_from_dict(balance_model))
+        if not isinstance(balance_source, str) or not balance_source:
+            raise ValueError(
+                "balance_source must be the ID of a model source when "
+                "balance_model is given"
+            )
+        # Validate the reference early for a clear error on unknown IDs.
+        model.source_meta(balance_source)
+        if not isinstance(source, tuple):
+            raise ValueError(
+                "balance_model can only be applied to file Band sources; "
+                "ndarray sources are not supported"
+            )
+        src_rdr, src_bidx, _, _ = source
+        raw_bands = [src_bidx] if isinstance(src_bidx, int) else list(src_bidx)
+        for raw_band in raw_bands:
+            model.validate_band(src_rdr, balance_source, raw_band)
+        if src_geoloc_array is not None or gcps is not None or rpcs is not None:
+            raise ValueError(
+                "balance_model cannot be combined with gcps, rpcs or "
+                "src_geoloc_array sources"
+            )
+
+        xml = calibrated_vrt_xml(
+            src_rdr, balance_source, model, raw_bands
+        )
+        memfile = rasterio.MemoryFile(xml, ext=".vrt")
+        balance_stack.enter_context(memfile)
+        calibrated_ds = balance_stack.enter_context(memfile.open())
+        source = rasterio.band(calibrated_ds, list(range(1, len(raw_bands) + 1)))
+        src_transform = calibrated_ds.transform
+        src_crs = calibrated_ds.crs
+        # Always pass the VRT's shared calibrated nodata explicitly: GDAL's
+        # automatic per-band nodata fallback only reads the first band and
+        # would miss differently calibrated sentinels.
+        if src_nodata is None:
+            src_nodata = calibrated_ds.nodata
+        elif calibrated_ds.nodata is not None and src_nodata != calibrated_ds.nodata:
+            # A caller-provided src_nodata refers to raw source semantics and
+            # cannot be combined with calibration; the VRT sentinel is the
+            # meaningful one after scaling.
+            src_nodata = calibrated_ds.nodata
+        # Rasterio defaults to UNIFIED_SRC_NODATA=YES, which only masks a
+        # pixel when *every* band is nodata and would therefore erase
+        # independent per-band masks (e.g. a hole present on band 2 only).
+        # Per-band validity is the documented balance semantics.
+        kwargs = dict(kwargs)
+        kwargs.setdefault("UNIFIED_SRC_NODATA", "NO")
 
     # calculate the destination transform if not provided
     if dst_transform is None and (destination is None or isinstance(destination, np.ndarray)):
@@ -379,31 +452,35 @@ def reproject(
 
         if destination is None:
             destination = np.empty(
-                (int(dst_count), int(dst_height), int(dst_width)), dtype=source.dtype
+                (int(dst_count), int(dst_height), int(dst_width)),
+                dtype=np.float64 if balance_model is not None else source.dtype,
             )
             if masked:
                 destination = np.ma.masked_array(destination).filled(dst_nodata)
 
-    dest = _reproject(
-        source,
-        destination,
-        src_transform=src_transform,
-        gcps=gcps,
-        rpcs=rpcs,
-        src_crs=src_crs,
-        src_nodata=src_nodata,
-        dst_transform=dst_transform,
-        dst_crs=dst_crs,
-        dst_nodata=dst_nodata,
-        dst_alpha=dst_alpha,
-        src_alpha=src_alpha,
-        resampling=resampling,
-        init_dest_nodata=init_dest_nodata,
-        num_threads=num_threads,
-        warp_mem_limit=warp_mem_limit,
-        src_geoloc_array=src_geoloc_array,
-        **kwargs
-    )
+    try:
+        dest = _reproject(
+            source,
+            destination,
+            src_transform=src_transform,
+            gcps=gcps,
+            rpcs=rpcs,
+            src_crs=src_crs,
+            src_nodata=src_nodata,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            dst_nodata=dst_nodata,
+            dst_alpha=dst_alpha,
+            src_alpha=src_alpha,
+            resampling=resampling,
+            init_dest_nodata=init_dest_nodata,
+            num_threads=num_threads,
+            warp_mem_limit=warp_mem_limit,
+            src_geoloc_array=src_geoloc_array,
+            **kwargs
+        )
+    finally:
+        balance_stack.close()
 
     return dest, dst_transform
 

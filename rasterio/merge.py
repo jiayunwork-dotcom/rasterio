@@ -12,6 +12,11 @@ import numpy as np
 
 import rasterio
 from rasterio import windows
+from rasterio.balance import (
+    apply_affine,
+    fit_affine_balance,
+    read_physical_window,
+)
 from rasterio.enums import Resampling
 from rasterio.errors import (
     MergeError,
@@ -112,6 +117,11 @@ def merge(
     masked=False,
     dst_path=None,
     dst_kwds=None,
+    balance=None,
+    source_ids=None,
+    balance_reference=None,
+    balance_report=None,
+    balance_sample_limit=100000,
 ):
     """Copy valid pixels from input files to an output file.
 
@@ -200,6 +210,26 @@ def merge(
     dst_kwds : dict, optional
         Dictionary of creation options and other parameters that will be
         overlaid on the profile of the output dataset.
+    balance : str, optional
+        ``None`` (default) keeps the historical behaviour exactly.  The only
+        supported mode is ``"affine"``: a per-source, per-band affine
+        calibration (gain and bias) is jointly estimated from the valid
+        overlapping pixels, with ``balance_reference`` anchoring the frame,
+        and every source is transformed into that frame while merging.
+    source_ids : sequence of str, optional
+        Non-empty, unique identifiers in one-to-one correspondence with
+        ``sources``.  Required when ``balance`` is set.
+    balance_reference : str, optional
+        ID of the reference source.  Its gain is 1 and bias 0 on every
+        selected band.  Required when ``balance`` is set.
+    balance_report : str or PathLike, optional
+        Path of the JSON file receiving the fitted model, full metadata and
+        diagnostics.  Required when ``balance`` is set; the report is
+        written before any output pixel is computed.
+    balance_sample_limit : int, optional
+        Maximum number of valid paired pixels retained for the whole fit,
+        shared deterministically across all overlaps and bands.  Must be a
+        positive integer.  Default 100000.
 
     Returns
     -------
@@ -216,6 +246,9 @@ def merge(
     MergeError
         When sources cannot be merged due to incompatibility between
         them or limitations of the tool.
+    ValueError
+        For invalid arguments, including invalid balance configuration or
+        an unidentifiable calibration model.
     """
     if precision is not None:
         warnings.warn(
@@ -233,6 +266,52 @@ def merge(
                 method, list(MERGE_METHODS.keys())
             )
         )
+
+    balance_model = None
+    if balance is not None:
+        if balance != "affine":
+            raise ValueError(
+                f"Unknown balance mode {balance!r}; only 'affine' is supported"
+            )
+        if method not in ("first", "last"):
+            raise ValueError(
+                f"balance='affine' supports only the 'first' and 'last' merge "
+                f"methods, got {method!r}"
+            )
+        if not isinstance(balance_sample_limit, int) or isinstance(
+            balance_sample_limit, bool
+        ) or balance_sample_limit <= 0:
+            raise ValueError(
+                "balance_sample_limit must be a positive integer, got "
+                f"{balance_sample_limit!r}"
+            )
+        if not source_ids or len(source_ids) != len(sources):
+            raise ValueError(
+                "source_ids must contain one non-empty identifier per source"
+            )
+        source_ids = [str(sid) for sid in source_ids]
+        if any(not sid for sid in source_ids) or len(set(source_ids)) != len(source_ids):
+            raise ValueError("source_ids must be non-empty and unique")
+        if not isinstance(balance_reference, str) or balance_reference not in source_ids:
+            raise ValueError(
+                "balance_reference must be one of the given source_ids, got "
+                f"{balance_reference!r}"
+            )
+        if balance_report is None:
+            raise ValueError(
+                "balance_report is required when balance='affine'"
+            )
+        if dtype is not None and np.issubdtype(np.dtype(dtype), np.integer):
+            raise ValueError(
+                "balance='affine' produces floating point data; an integer "
+                "dtype cannot be requested"
+            )
+        if dtype is None:
+            dtype = "float64"
+        if nodata is not None and not cmath.isfinite(nodata):
+            raise ValueError("balance mode requires a finite explicit nodata value")
+        if nodata is None:
+            nodata = np.nan
 
     # Create a dataset_opener object to use in several places in this function.
     if isinstance(sources[0], (str, os.PathLike)):
@@ -273,6 +352,56 @@ def merge(
 
         if not output_count:
             output_count = src_count
+
+        if balance is not None:
+            selected_indexes = (
+                list(range(1, src_count + 1))
+                if indexes is None
+                else [indexes] if isinstance(indexes, int) else list(indexes)
+            )
+            # Keep GDAL's block cache bounded across the whole fit-and-write
+            # job so large tiled sources do not accumulate decompressed
+            # blocks without limit.  A user-set cache is respected.
+            from rasterio.balance import FIT_GDAL_CACHEMAX_MB
+            from rasterio.errors import EnvError
+
+            try:
+                user_cache = rasterio.env.getenv().get("GDAL_CACHEMAX")
+            except EnvError:
+                user_cache = None
+            if user_cache is None:
+                exit_stack.enter_context(
+                    rasterio.Env(GDAL_CACHEMAX=FIT_GDAL_CACHEMAX_MB)
+                )
+            # Structural validation and joint fit happen before any output
+            # dataset is created, so failed calibration leaves no artifacts.
+            opened = [
+                exit_stack.enter_context(dataset_opener(src)) for src in sources
+            ]
+            for idx, src in enumerate(opened):
+                if src.crs != first_crs:
+                    raise RasterioError(f"CRS mismatch with source: {sources[idx]}")
+                if not src.transform.is_rectilinear or src.transform.a < 0 or src.transform.e > 0:
+                    raise MergeError(
+                        "Only north-up, rectilinear rasters can be balanced."
+                    )
+                if src.count != opened[0].count:
+                    raise MergeError(
+                        "All sources must have the same number of bands for balance mode."
+                    )
+                if max(selected_indexes) > src.count:
+                    raise MergeError(
+                        f"source {source_ids[idx]!r} does not have band(s) {selected_indexes}"
+                    )
+            balance_model = fit_affine_balance(
+                opened,
+                source_ids=source_ids,
+                reference_id=balance_reference,
+                indexes=selected_indexes,
+                sample_limit=balance_sample_limit,
+            )
+            balance_model.to_json(balance_report)
+            logger.debug("Wrote balance report to %s", balance_report)
 
         # Extent from option or extent of all inputs
         if bounds:
@@ -431,7 +560,11 @@ def merge(
         for chunk in chunks:
             dst_w, dst_s, dst_e, dst_n = windows.bounds(chunk, output_transform)
             dest = np.zeros((output_count, chunk.height, chunk.width), dtype=dt)
-            if inrange:
+            if balance_model is not None:
+                # Float output: always mark uncovered pixels with the
+                # configured nodata (NaN by default) before compositing.
+                dest.fill(nodataval)
+            elif inrange:
                 dest.fill(nodataval)
 
             # From gh-2221
@@ -486,23 +619,64 @@ def merge(
                     else:
                         region_mask = region == nodataval
 
-                    data = src.read(
-                        out_shape=(src_count, cw.height, cw.width),
-                        indexes=indexes,
-                        masked=True,
-                        window=sw,
-                        resampling=resampling,
-                    )
+                    if balance_model is not None:
+                        # Physical values -> reference frame, band by band.
+                        # Validity (nodata, mask band, NaN/inf) is evaluated
+                        # per band; scales/offsets are applied exactly once.
+                        sid = source_ids[idx]
+                        calibrated = np.empty(
+                            (output_count, cw.height, cw.width), dtype=np.float64
+                        )
+                        valid_stack = np.empty(
+                            (output_count, cw.height, cw.width), dtype=bool
+                        )
+                        for out_pos, raw_band in enumerate(selected_indexes):
+                            phys, valid = read_physical_window(
+                                src,
+                                raw_band,
+                                sw,
+                                out_shape=(cw.height, cw.width),
+                            )
+                            gain, bias = balance_model.coefficients(sid, raw_band)
+                            calibrated[out_pos] = apply_affine(phys, gain, bias)
+                            valid_stack[out_pos] = valid
+                        data = np.ma.array(
+                            calibrated,
+                            mask=~valid_stack,
+                            fill_value=nodataval,
+                        )
+                    else:
+                        data = src.read(
+                            out_shape=(src_count, cw.height, cw.width),
+                            indexes=indexes,
+                            masked=True,
+                            window=sw,
+                            resampling=resampling,
+                        )
 
-                    copyto(
-                        region,
-                        data,
-                        region_mask,
-                        data.mask,
-                        index=idx,
-                        roff=cw.row_off,
-                        coff=cw.col_off,
-                    )
+                    if balance_model is not None:
+                        # Validity-driven compositing.  The region's existing
+                        # validity is defined by the configured nodata
+                        # (NaN by default), so zero stays a legal value.
+                        if cmath.isnan(nodataval):
+                            existing_invalid = ~np.isfinite(region)
+                        else:
+                            existing_invalid = region == nodataval
+                        if method == "last":
+                            take = valid_stack
+                        else:  # first: keep existing valid pixels
+                            take = valid_stack & existing_invalid
+                        np.copyto(region, calibrated, where=take, casting="unsafe")
+                    else:
+                        copyto(
+                            region,
+                            data,
+                            region_mask,
+                            data.mask,
+                            index=idx,
+                            roff=cw.row_off,
+                            coff=cw.col_off,
+                        )
 
             if dst:
                 dw = windows.from_bounds(*chunk_bounds, output_transform)
@@ -511,7 +685,10 @@ def merge(
 
         if dst is None:
             if masked:
-                dest = np.ma.masked_equal(dest, nodataval, copy=False)
+                if cmath.isnan(nodataval):
+                    dest = np.ma.masked_invalid(dest, copy=False)
+                else:
+                    dest = np.ma.masked_equal(dest, nodataval, copy=False)
             return dest, output_transform
         else:
             if first_colormap:

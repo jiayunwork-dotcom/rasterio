@@ -6,6 +6,7 @@ from math import ceil, floor
 import sys
 
 import click
+import numpy as np
 
 import rasterio
 from rasterio.crs import CRS
@@ -100,6 +101,17 @@ def _(obj):
     is_flag=True,
     help="Do not create an output file, but report on its expected size and other characteristics.",
 )
+@click.option(
+    "--balance-model",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="JSON balance model (from 'rio merge --balance') to apply while warping.",
+)
+@click.option(
+    "--balance-source",
+    default=None,
+    help="Source ID within the balance model identifying the input dataset.",
+)
 @click.pass_context
 def warp(
     ctx,
@@ -122,6 +134,8 @@ def warp(
     target_aligned_pixels,
     warper_options,
     dry_run,
+    balance_model,
+    balance_source,
 ):
     """
     Warp a raster dataset.
@@ -393,6 +407,23 @@ def warp(
                 click.echo("Output dataset profile:")
                 click.echo(json.dumps(dict(**out_kwargs), indent=2, default=to_json))
             else:
+                balance_kwargs = {}
+                if balance_model is not None:
+                    if not balance_source:
+                        raise click.BadParameter(
+                            "--balance-source is required with --balance-model"
+                        )
+                    # Calibrated values are float64 physical quantities;
+                    # promote an inherited integer or narrow float profile.
+                    if "float" not in str(out_kwargs.get("dtype", "")) or np.dtype(
+                        out_kwargs["dtype"]
+                    ).itemsize < 8:
+                        out_kwargs["dtype"] = "float64"
+                    with open(balance_model, "r", encoding="utf-8") as fh:
+                        balance_kwargs = {
+                            "balance_model": json.load(fh),
+                            "balance_source": balance_source,
+                        }
                 with rasterio.open(output, "w", **out_kwargs) as dst:
                     reproject(
                         source=rasterio.band(src, list(range(1, src.count + 1))),
@@ -405,5 +436,6 @@ def warp(
                         dst_nodata=dst_nodata,
                         resampling=resampling,
                         num_threads=threads,
-                        **warper_options
+                        **warper_options,
+                        **balance_kwargs,
                     )

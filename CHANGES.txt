@@ -1,6 +1,22 @@
 Changes
 =======
 
+Next
+----
+
+Enhancements:
+
+- New affine balance mode for ``rasterio.merge.merge`` (``balance="affine"``):
+  jointly estimates per-source, per-band gain/bias calibration from valid
+  overlapping pixels, anchors one reference source at identity, writes the
+  model and diagnostics to a JSON report, and applies the calibration while
+  merging.  ``rasterio.warp.reproject`` and ``rio warp`` can reuse a saved
+  model via ``balance_model``/``balance_source``; ``rio merge`` gains the
+  matching CLI options.  The robust NumPy-only solver needs no SciPy
+  dependency, streams overlap samples within a fixed sample limit and a
+  bounded GDAL block cache, and rejects unidentifiable models before any
+  output is created.
+
 1.4.4 (2025-12-12)
 ------------------
 

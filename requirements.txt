@@ -10,5 +10,10 @@ click-plugins
 cligj>=0.5
 matplotlib
 numpy>=1.24
+# Optional: the affine balance estimator (rasterio.balance) is implemented
+# with NumPy alone.  SciPy is not imported at runtime and only needs to be
+# installed if downstream code extends the robust solver with sparse
+# routines: pip install scipy
+# scipy>=1.11
 setuptools>=20.0
 pyparsing~=3.1
