@@ -1085,6 +1085,19 @@ def calibrated_vrt_xml(dataset, source_id, model, band_indexes):
     ``ScaleRatio`` / ``ScaleOffset`` so that GDAL computes
     ``gain * (raw * file_scale + file_offset) + bias`` while warping.
     Nothing is materialised and the source file is opened, not modified.
+
+    Validity is carried per band and never collapsed into a single scalar:
+
+    * every VRT band advertises its *own* calibrated nodata -- the image of
+      the raw nodata under that band's file scale/offset and model
+      gain/bias -- so a legal finite value on one band (even one equal to
+      another band's calibrated sentinel, including zero) is not erased;
+    * the source-level ``NODATA`` element filters raw invalid pixels before
+      scaling, and an explicit mask band is forwarded when the dataset has
+      one (nodata, mask band and open edges are all honoured by GDAL);
+    * non-finite calibrated results (NaN or an overflow to +/- infinity)
+      are rejected by the caller after warping, since a VRT cannot express
+      "infinity is invalid" declaratively.
     """
     import xml.etree.ElementTree as ET
 
@@ -1101,24 +1114,6 @@ def calibrated_vrt_xml(dataset, source_id, model, band_indexes):
     gt = ET.SubElement(root, "GeoTransform")
     gt.text = ",".join(str(v) for v in transform.to_gdal())
 
-    # GDAL's warper takes a single scalar src_nodata, so every VRT band must
-    # advertise the same calibrated nodata.  Use the smallest calibrated
-    # sentinel magnitude (a value no clean measurement reaches) consistently;
-    # the source-level NODATA element on each ComplexSource still filters raw
-    # invalid pixels before scaling.
-    calibrated_sentinels = []
-    for raw_bidx in band_indexes:
-        pos = meta["band_indexes"].index(raw_bidx)
-        gain, bias = model.coefficients(source_id, raw_bidx)
-        raw_nodata = meta["nodata"][pos]
-        if raw_nodata is not None:
-            ratio = gain * meta["scales"][pos]
-            offset = gain * meta["offsets"][pos] + bias
-            calibrated_sentinels.append(float(raw_nodata) * ratio + offset)
-    shared_nodata = (
-        min(calibrated_sentinels, key=abs) if calibrated_sentinels else None
-    )
-
     for out_bidx, raw_bidx in enumerate(band_indexes, start=1):
         pos = meta["band_indexes"].index(raw_bidx)
         gain, bias = model.coefficients(source_id, raw_bidx)
@@ -1131,9 +1126,15 @@ def calibrated_vrt_xml(dataset, source_id, model, band_indexes):
         band_el.attrib["dataType"] = "Float64"
         band_el.attrib["band"] = str(out_bidx)
         nodata = meta["nodata"][pos]
-        if shared_nodata is not None:
-            nd = ET.SubElement(band_el, "NoDataValue")
-            nd.text = repr(float(shared_nodata))
+        if nodata is not None:
+            # Per-band calibrated sentinel.  It is only written when finite:
+            # an infinite/NaN sentinel cannot be matched against finite
+            # observations anyway, and validity then comes from the source
+            # mask and the post-warp finite check.
+            calibrated_nodata = float(nodata) * ratio + offset
+            if math.isfinite(calibrated_nodata):
+                nd = ET.SubElement(band_el, "NoDataValue")
+                nd.text = repr(calibrated_nodata)
         ci = ET.SubElement(band_el, "ColorInterp")
         ci.text = "Gray" if out_bidx == 1 else "Undefined"
 

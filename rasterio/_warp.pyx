@@ -172,13 +172,42 @@ cdef GDALWarpOptions * create_warp_options(
     # Assign nodata values.
     # We don't currently support an imaginary component.
 
-    if src_nodata is not None:
-        psWOptions.padfSrcNoDataReal = <double*>CPLMalloc(band_count * sizeof(double))
-        psWOptions.padfSrcNoDataImag = <double*>CPLMalloc(band_count * sizeof(double))
+    cdef int i
 
-        for i in range(band_count):
-            psWOptions.padfSrcNoDataReal[i] = float(src_nodata)
-            psWOptions.padfSrcNoDataImag[i] = 0.0
+    if src_nodata is not None:
+        # A sequence gives one nodata value per source band, preserving
+        # independent per-band masks through the warper.  A scalar is
+        # broadcast to every band (the historical behaviour).
+        if isinstance(src_nodata, (list, tuple)):
+            if len(src_nodata) != band_count:
+                raise ValueError(
+                    "src_nodata sequence length must match the number of "
+                    "source bands"
+                )
+            psWOptions.padfSrcNoDataReal = <double*>CPLMalloc(
+                band_count * sizeof(double))
+            psWOptions.padfSrcNoDataImag = <double*>CPLMalloc(
+                band_count * sizeof(double))
+
+            for i in range(band_count):
+                if src_nodata[i] is None:
+                    # No nodata for this band: NaN is an unreachable
+                    # sentinel for real-valued data, so the band's own
+                    # mask / NaN / infinity handling stays in charge.
+                    psWOptions.padfSrcNoDataReal[i] = <double>float("nan")
+                else:
+                    psWOptions.padfSrcNoDataReal[i] = <double>float(
+                        src_nodata[i])
+                psWOptions.padfSrcNoDataImag[i] = 0.0
+        else:
+            psWOptions.padfSrcNoDataReal = <double*>CPLMalloc(
+                band_count * sizeof(double))
+            psWOptions.padfSrcNoDataImag = <double*>CPLMalloc(
+                band_count * sizeof(double))
+
+            for i in range(band_count):
+                psWOptions.padfSrcNoDataReal[i] = float(src_nodata)
+                psWOptions.padfSrcNoDataImag[i] = 0.0
 
     if dst_nodata is not None:
         psWOptions.padfDstNoDataReal = <double*>CPLMalloc(band_count * sizeof(double))
@@ -333,7 +362,15 @@ def _reproject(
 
     # Validate nodata values immediately.
     if src_nodata is not None:
-        if not in_dtype_range(src_nodata, source.dtype):
+        if isinstance(src_nodata, (list, tuple)):
+            for value in src_nodata:
+                if value is not None and not in_dtype_range(
+                    value, source.dtype
+                ):
+                    raise ValueError(
+                        "src_nodata must be in valid range for source dtype"
+                    )
+        elif not in_dtype_range(src_nodata, source.dtype):
             raise ValueError("src_nodata must be in valid range for "
                              "source dtype")
 
@@ -437,7 +474,12 @@ def _reproject(
             if not dst_crs:
                 raise CRSError("Missing dst_crs.")
 
-            dst_nodata = dst_nodata or src_nodata
+            # dst_nodata stays scalar: only fall back to a scalar source
+            # nodata, never to a per-band sequence.
+            if dst_nodata is None and not isinstance(
+                src_nodata, (list, tuple)
+            ):
+                dst_nodata = src_nodata
 
             if hasattr(destination, "mask"):
                 destination = np.ma.asanyarray(destination)

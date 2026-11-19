@@ -17,6 +17,29 @@ Enhancements:
   bounded GDAL block cache, and rejects unidentifiable models before any
   output is created.
 
+Bug fixes:
+
+- Per-band validity is now preserved through affine calibration and GDAL
+  warping.  The balanced ``reproject`` builds a calibrated VRT with one
+  calibrated nodata value per band (instead of a single shared multi-band
+  sentinel), passes those values to the warper as a per-band source nodata
+  sequence with ``UNIFIED_SRC_NODATA=NO``, and streams the warp over
+  destination windows.  A legal finite value -- including zero, even when it
+  equals another band's calibrated nodata -- is no longer erased, and bands
+  keep independent holes.  Source nodata, explicit dataset mask bands and
+  NaN/+/-infinity are all recognized; after file scale/offset and the model
+  gain/bias are applied, only finite floating-point results count as valid
+  observations.  Non-finite calibrated results (e.g. overflow to infinity)
+  are replaced with the destination nodata and can no longer appear in the
+  output.
+- ``merge(balance="affine")`` now rejects non-finite calibrated candidates
+  during compositing, so with ``first``/``last`` such a candidate neither
+  occupies an uncovered cell nor overwrites an existing valid observation;
+  cells with no valid source receive the output nodata (NaN by default).
+- ``_reproject`` accepts a per-band sequence of source nodata values (a
+  scalar keeps the historical broadcast behavior), enabling independent
+  per-band masks through the GDAL warper.
+
 1.4.4 (2025-12-12)
 ------------------
 

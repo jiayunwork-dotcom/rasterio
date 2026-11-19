@@ -638,8 +638,15 @@ def merge(
                                 out_shape=(cw.height, cw.width),
                             )
                             gain, bias = balance_model.coefficients(sid, raw_band)
-                            calibrated[out_pos] = apply_affine(phys, gain, bias)
-                            valid_stack[out_pos] = valid
+                            calibrated_band = apply_affine(phys, gain, bias)
+                            calibrated[out_pos] = calibrated_band
+                            # Only finite calibrated results are valid
+                            # observations: an overflow to +/- infinity or a
+                            # propagated NaN must not occupy a cell or
+                            # overwrite an already composited valid value.
+                            valid_stack[out_pos] = valid & np.isfinite(
+                                calibrated_band
+                            )
                         data = np.ma.array(
                             calibrated,
                             mask=~valid_stack,
@@ -655,13 +662,18 @@ def merge(
                         )
 
                     if balance_model is not None:
-                        # Validity-driven compositing.  The region's existing
-                        # validity is defined by the configured nodata
-                        # (NaN by default), so zero stays a legal value.
+                        # Validity-driven compositing.  A cell is available
+                        # only when it holds no finite value yet: the default
+                        # fill is the configured nodata (NaN by default), and
+                        # non-finite leftovers from earlier sources are holes
+                        # rather than observations, so zero stays a legal
+                        # value and is never mistaken for a sentinel.
                         if cmath.isnan(nodataval):
                             existing_invalid = ~np.isfinite(region)
                         else:
-                            existing_invalid = region == nodataval
+                            existing_invalid = (region == nodataval) | (
+                                ~np.isfinite(region)
+                            )
                         if method == "last":
                             take = valid_stack
                         else:  # first: keep existing valid pixels

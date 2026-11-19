@@ -1,5 +1,6 @@
 """Raster warping and reprojection."""
 
+import math
 from contextlib import ExitStack
 from math import ceil, floor
 
@@ -19,6 +20,7 @@ from rasterio.enums import Resampling
 from rasterio.env import ensure_env, require_gdal_version
 from rasterio.errors import TransformError, RPCError
 from rasterio.transform import array_bounds
+from rasterio.windows import Window, transform as window_transform
 from rasterio._warp import (
     _calculate_default_transform,
     _reproject,
@@ -161,6 +163,186 @@ def transform_bounds(
         top,
         densify_pts,
     )
+
+
+def _destination_windows(destination, dst_width, dst_height, dst_transform):
+    """Yield ``(window, window_transform)`` pairs covering a destination.
+
+    For a file :class:`rasterio.Band` destination the native block lattice of
+    the first output band is reused (de-duplicated across bands), which keeps
+    reads and writes aligned with the file's tiling.  An ndarray destination
+    is processed as one window -- the caller already holds the whole array, so
+    streaming there would only add copies.  The destination blocks partition
+    the output without overlap, so iterating them changes memory use but not
+    the numerical result.
+    """
+    if isinstance(destination, np.ndarray):
+        window = Window(0, 0, dst_width, dst_height)
+        yield window, window_transform(window, dst_transform)
+        return
+
+    udr, dst_bidx, _, _ = destination
+    if isinstance(dst_bidx, int):
+        dst_bidx = [dst_bidx]
+    seen = set()
+    for _, block in udr.block_windows(dst_bidx[0]):
+        key = (
+            int(block.col_off),
+            int(block.row_off),
+            int(block.width),
+            int(block.height),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        # Clamp to the output extent: edge blocks may be reported full-sized.
+        block = block.intersection(Window(0, 0, dst_width, dst_height))
+        yield block, window_transform(block, dst_transform)
+    if not seen:
+        window = Window(0, 0, dst_width, dst_height)
+        yield window, window_transform(window, dst_transform)
+
+
+def _balanced_reproject(
+    calibrated_ds,
+    raw_bands,
+    destination,
+    *,
+    dst_transform,
+    dst_crs,
+    dst_nodata,
+    resampling,
+    num_threads,
+    warp_mem_limit,
+    warp_kwargs,
+    dst_width,
+    dst_height,
+    init_dest_nodata=True,
+):
+    """Warp a calibrated VRT while preserving independent per-band validity.
+
+    The VRT advertises a calibrated nodata per band and forwards explicit
+    mask bands, so GDAL's warper treats source nodata, mask bands, NaN and
+    infinities band by band (``UNIFIED_SRC_NODATA=NO``).  Warping is driven
+    destination-window by destination-window; only one window's arrays are
+    resident at a time.  After each window warp, non-finite calibrated
+    results (overflow to +/- infinity or NaN) are rejected and replaced with
+    the destination nodata.  On reopening a file destination, validity is
+    therefore recovered per band from the finite-vs-nodata distinction:
+    non-finite results and cells equal to a finite destination nodata (the
+    warper's representation of source holes and mask-band zeros) are invalid.
+    A legal finite value, including one that equals another band's
+    calibrated sentinel or zero itself, is always valid.
+    """
+    n_bands = len(raw_bands)
+    src_transform = calibrated_ds.transform
+    src_crs = calibrated_ds.crs
+
+    # One nodata entry per source band.  ``None`` means "no scalar sentinel
+    # for this band": the compiled warper encodes it as an unreachable NaN,
+    # leaving the VRT's own per-band nodata/mask semantics in force.
+    per_band_nodata = list(calibrated_ds.nodatavals[:n_bands])
+
+    finite_dst_nodata = dst_nodata is not None and (
+        not isinstance(dst_nodata, float) or math.isfinite(dst_nodata)
+    )
+
+    if isinstance(destination, np.ndarray):
+        dst_array = destination
+        if dst_array.ndim == 2:
+            dst_array = dst_array[None, ...]
+        for window, win_transform in _destination_windows(
+            destination, dst_width, dst_height, dst_transform
+        ):
+            rows, cols = window.toslices()
+            target = dst_array[:, rows, cols]
+            if init_dest_nodata and dst_nodata is not None:
+                target.fill(dst_nodata)
+            _reproject(
+                source=rasterio.band(
+                    calibrated_ds, list(range(1, n_bands + 1))
+                ),
+                destination=target,
+                src_transform=src_transform,
+                src_crs=src_crs,
+                src_nodata=per_band_nodata,
+                dst_transform=win_transform,
+                dst_crs=dst_crs,
+                dst_nodata=dst_nodata,
+                resampling=resampling,
+                init_dest_nodata=init_dest_nodata,
+                num_threads=num_threads,
+                warp_mem_limit=warp_mem_limit,
+                UNIFIED_SRC_NODATA="NO",
+                **warp_kwargs,
+            )
+            _reject_nonfinite(target, dst_nodata, finite_dst_nodata)
+        return destination
+
+    udr, dst_bidx, _, _ = destination
+    if isinstance(dst_bidx, int):
+        dst_bidx = [dst_bidx]
+    dtype = udr.dtypes[dst_bidx[0] - 1]
+    for window, win_transform in _destination_windows(
+        destination, dst_width, dst_height, dst_transform
+    ):
+        buf = np.empty(
+            (n_bands, int(window.height), int(window.width)), dtype=dtype
+        )
+        if init_dest_nodata and dst_nodata is not None:
+            buf.fill(dst_nodata)
+        _reproject(
+            source=rasterio.band(
+                calibrated_ds, list(range(1, n_bands + 1))
+            ),
+            destination=buf,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            src_nodata=per_band_nodata,
+            dst_transform=win_transform,
+            dst_crs=dst_crs,
+            dst_nodata=dst_nodata,
+            resampling=resampling,
+            init_dest_nodata=init_dest_nodata,
+            num_threads=num_threads,
+            warp_mem_limit=warp_mem_limit,
+            UNIFIED_SRC_NODATA="NO",
+            **warp_kwargs,
+        )
+        invalid = _invalid_cells(buf, dst_nodata, finite_dst_nodata)
+        if finite_dst_nodata:
+            buf[invalid] = dst_nodata
+        udr.write(buf, indexes=list(dst_bidx), window=window)
+        # Validity is recovered per band on reopen from the finite-vs-nodata
+        # distinction above, including independent holes (a cell may be
+        # nodata on one band and a finite observation on another).  A
+        # separately stored mask band cannot add information here, and a
+        # GeoTIFF's per-dataset mask band is shared between bands and would
+        # collapse the per-band validity, so we rely on the nodata marker.
+    return destination
+
+
+def _invalid_cells(target, dst_nodata, finite_dst_nodata):
+    """Validity mask of a warped window.
+
+    A cell is invalid when it holds no finite calibrated observation:
+    non-finite results (NaN, +/- infinity) always, and cells equal to the
+    finite destination nodata (the warper's representation of source holes
+    and mask-band zeros).  A legal finite value -- including zero, even when
+    zero is another band's calibrated sentinel -- never matches this test.
+    """
+    invalid = ~np.isfinite(target)
+    if finite_dst_nodata:
+        invalid |= target == dst_nodata
+    return invalid
+
+
+def _reject_nonfinite(target, dst_nodata, finite_dst_nodata):
+    """Replace NaN/+/-inf cells of an ndarray window with the output nodata."""
+    invalid = ~np.isfinite(target)
+    if invalid.any() and finite_dst_nodata:
+        target[invalid] = dst_nodata
+    return invalid
 
 
 @ensure_env
@@ -362,25 +544,74 @@ def reproject(
         memfile = rasterio.MemoryFile(xml, ext=".vrt")
         balance_stack.enter_context(memfile)
         calibrated_ds = balance_stack.enter_context(memfile.open())
-        source = rasterio.band(calibrated_ds, list(range(1, len(raw_bands) + 1)))
-        src_transform = calibrated_ds.transform
-        src_crs = calibrated_ds.crs
-        # Always pass the VRT's shared calibrated nodata explicitly: GDAL's
-        # automatic per-band nodata fallback only reads the first band and
-        # would miss differently calibrated sentinels.
-        if src_nodata is None:
-            src_nodata = calibrated_ds.nodata
-        elif calibrated_ds.nodata is not None and src_nodata != calibrated_ds.nodata:
-            # A caller-provided src_nodata refers to raw source semantics and
-            # cannot be combined with calibration; the VRT sentinel is the
-            # meaningful one after scaling.
-            src_nodata = calibrated_ds.nodata
-        # Rasterio defaults to UNIFIED_SRC_NODATA=YES, which only masks a
-        # pixel when *every* band is nodata and would therefore erase
-        # independent per-band masks (e.g. a hole present on band 2 only).
-        # Per-band validity is the documented balance semantics.
+        # A caller-provided src_nodata refers to raw, pre-calibration source
+        # semantics and cannot be combined with the model; validity after
+        # calibration is defined per band by the VRT's own nodata values and
+        # mask bands.  Reject it explicitly rather than silently applying it
+        # to scaled values.
+        if src_nodata is not None:
+            raise ValueError(
+                "src_nodata cannot be combined with balance_model: the "
+                "calibrated VRT carries per-band nodata and mask semantics "
+                "derived from the model"
+            )
+        if src_alpha or dst_alpha:
+            raise ValueError(
+                "balance_model cannot be combined with src_alpha/dst_alpha"
+            )
         kwargs = dict(kwargs)
-        kwargs.setdefault("UNIFIED_SRC_NODATA", "NO")
+
+        # Determine the target grid up front so the streaming engine can
+        # iterate destination windows.  This mirrors the default-transform
+        # logic used by the plain array/Band path below.
+        if dst_transform is None:
+            dst_transform, dst_width, dst_height = calculate_default_transform(
+                src_crs=calibrated_ds.crs,
+                dst_crs=dst_crs,
+                width=calibrated_ds.width,
+                height=calibrated_ds.height,
+                left=calibrated_ds.bounds.left,
+                bottom=calibrated_ds.bounds.bottom,
+                right=calibrated_ds.bounds.right,
+                top=calibrated_ds.bounds.top,
+                resolution=dst_resolution,
+            )
+            dst_crs = dst_crs or calibrated_ds.crs
+        else:
+            if isinstance(destination, np.ndarray):
+                dst_height, dst_width = destination.shape[-2:]
+            else:
+                dst_height, dst_width = destination[3]
+
+        if destination is None:
+            destination = np.empty(
+                (len(raw_bands), int(dst_height), int(dst_width)),
+                dtype=np.float64,
+            )
+            if masked:
+                destination = np.ma.masked_array(destination).filled(
+                    dst_nodata
+                )
+
+        try:
+            _balanced_reproject(
+                calibrated_ds,
+                raw_bands,
+                destination,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                dst_nodata=dst_nodata,
+                resampling=resampling,
+                num_threads=num_threads,
+                warp_mem_limit=warp_mem_limit,
+                warp_kwargs=kwargs,
+                dst_width=int(dst_width),
+                dst_height=int(dst_height),
+                init_dest_nodata=init_dest_nodata,
+            )
+        finally:
+            balance_stack.close()
+        return destination, dst_transform
 
     # calculate the destination transform if not provided
     if dst_transform is None and (destination is None or isinstance(destination, np.ndarray)):
